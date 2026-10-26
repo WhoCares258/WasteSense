@@ -1,27 +1,41 @@
 # WasteSense
 
-WasteSense is a research project focused on deep learning-based waste image classification.
+**AI-Powered Waste Classification Using Computer Vision**
 
-This repository contains the original Python scripts used to obtain the experimental results across three benchmark datasets. The scripts are provided for research reference and experimental validation.
-
-## Repository Files
-
-- `trashnet.py` - TrashNet experiments
-- `realwaste.py` - RealWaste experiments
-- `houshold.py` - Household Garbage experiments
+WasteSense is a deep learning research project focused on accurate and reliable waste classification using the EVA02 Vision Transformer. The project explores the application of advanced computer vision techniques to support intelligent waste segregation, recycling, and sustainable waste management.
 
 ## Datasets Used
 
-All three datasets are publicly available:
+WasteSense was evaluated across three publicly available benchmark datasets:
 
-1. **TrashNet:** [Hugging Face](https://huggingface.co/datasets/garythung/trashnet)
-2. **RealWaste:** [UCI Machine Learning Repository](https://archive.ics.uci.edu/dataset/908/realwaste)
-3. **Household Garbage:** [Kaggle](https://www.kaggle.com/datasets/mostafaabla/garbage-classification)
+| Dataset | Images | Classes |
+|---|---:|---:|
+| TrashNet | 2,527 | 6 |
+| RealWaste | 4,752 | 9 |
+| Household Garbage | 15,515 | 12 |
+
+**Dataset Sources:**
+
+1. **TrashNet:** https://huggingface.co/datasets/garythung/trashnet/tree/main
+2. **RealWaste:** https://archive.ics.uci.edu/dataset/908/realwaste
+3. **Household Garbage:** https://www.kaggle.com/datasets/mostafaabla/garbage-classification
+
+## Repository Structure
+
+This repository contains the original Python scripts used to generate and validate the experimental results across all three datasets.
+
+```text
+WasteSense/
+├── trashnet.py
+├── realwaste.py
+├── houshold.py
+└── README.md
+```
 
 ## Research Publication
 
-**Status:** In Review
+**Status:** Under Review
 
 **Expected Publication:** Early 2027
 
-Further experimental details, results, and analysis will be available in the research paper upon publication.
+Detailed methodology, experimental results, and performance evaluations will be available upon publication.
