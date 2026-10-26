@@ -1,6 +1,0 @@
-split_index,status,training_seed,best_val_accuracy,best_val_macro_f1,test_accuracy,test_macro_precision,test_macro_recall,test_macro_f1,test_weighted_f1,split_dir,output_dir
-0,completed,42,0.9665,0.9535,0.9791,0.9755,0.9825,0.9786,0.9791,trashnet-splits\split_0,runs\eva02_base_448_split_0
-1,completed,42,0.9604,0.9479,0.9768,0.9631,0.9809,0.9709,0.9770,trashnet-splits\split_1,runs\eva02_base_448_split_1
-2,completed,42,0.9695,0.9594,0.9768,0.9704,0.9682,0.9692,0.9767,trashnet-splits\split_2,runs\eva02_base_448_split_2
-3,completed,42,0.9634,0.9481,0.9722,0.9698,0.9641,0.9668,0.9720,trashnet-splits\split_3,runs\eva02_base_448_split_3
-4,completed,42,0.9848,0.9819,0.9791,0.9622,0.9725,0.9668,0.9793,trashnet-splits\split_4,runs\eva02_base_448_split_4
