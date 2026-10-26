@@ -10,7 +10,7 @@ This repository contains the original Python scripts used to obtain the experime
 - `realwaste.py` - RealWaste experiments
 - `houshold.py` - Household Garbage experiments
 
-## Datasets
+## Datasets Used
 
 All three datasets are publicly available:
 
