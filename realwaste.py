@@ -346,10 +346,14 @@ def evaluate(model, loader, criterion, device, return_predictions=False):
         labels_gpu = labels.to(device, non_blocking=True)
         with torch.amp.autocast('cuda', dtype=AMP_DTYPE):
             logits = model(images)
-            loss = criterion(logits, labels_gpu)
+        # Preserve the original RealWaste validation/test loss convention:
+        # ordinary cross-entropy without label smoothing. Training still
+        # uses label-smoothed cross-entropy through the supplied criterion.
+        batch_loss = nn.functional.cross_entropy(
+            logits.float(), labels_gpu, reduction='sum')
         probabilities_batch = torch.softmax(logits.float(), dim=1).cpu().numpy()
         preds = probabilities_batch.argmax(axis=1)
-        total_loss += loss.item() * labels.size(0)
+        total_loss += batch_loss.item()
         count += labels.size(0)
         targets.extend(labels.numpy().tolist())
         predictions.extend(preds.tolist())
