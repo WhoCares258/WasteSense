@@ -28,7 +28,7 @@ This repository contains the original Python scripts used to generate and valida
 WasteSense/
 ├── trashnet.py
 ├── realwaste.py
-├── houshold.py
+├── household.py
 └── README.md
 ```
 
