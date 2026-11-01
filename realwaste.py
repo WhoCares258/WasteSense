@@ -312,9 +312,7 @@ def main():
                 atomic_save(model,out/'best_head_model.pt',seed,classes,'head',ep+1)
         del optimizer,scaler
         gc.collect(); torch.cuda.empty_cache()
-        # Stage 2 begins from best stage-1 model.
-        head_ckpt=torch.load(out/'best_head_model.pt',map_location='cpu',weights_only=False)
-        model.load_state_dict(head_ckpt['model']); del head_ckpt
+        # Stage 2 continues directly from the final Stage 1 model state.
         for p in model.parameters(): p.requires_grad_(True)
         if hasattr(model,'set_grad_checkpointing'):
             model.set_grad_checkpointing(True)
