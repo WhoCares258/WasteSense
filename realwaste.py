@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
-"""RealWaste EVA02-Base two-stage fine-tuning with per-seed artifacts.
+"""RealWaste EVA02-Base repeated stratified holdout training.
 
-Requires: torch, torchvision, timm, scikit-learn, numpy, pandas, pillow.
-NOTE: check AUGMENTATIONS and preprocessing against your previous RealWaste
-script before calling a run an exact reproduction.
+Aligned with the training recipe used by the WasteSense TrashNet and Household
+Garbage scripts: timm transforms, EVA02 normalization, two-stage training,
+epoch-based cosine schedules, and validation-accuracy checkpoint selection.
+
+This is a harmonized reproduction implementation, not proof that the exact
+historical RealWaste image transforms or stochastic execution are recoverable.
+No previously reported experimental results are changed by this file.
+
+Requirements: torch, timm, scikit-learn, numpy, pandas, pillow.
+Examples:
+    python realwaste.py --data-dir ~/RealWaste --seeds 0 1 2 3 4
+    python realwaste.py --data-dir ~/RealWaste --resume
 """
+
+from __future__ import annotations
+
 import argparse
-import csv
 import gc
 import json
 import os
@@ -17,355 +28,554 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageFile
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import train_test_split
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from torchvision.transforms import InterpolationMode
+from torch.utils.data import DataLoader, Dataset
 import timm
+from timm.data import create_transform
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-MODEL = 'eva02_base_patch14_448.mim_in22k_ft_in22k_in1k'
-TRAIN_SEED = 42
-COUNTS = (3326, 617, 809)
-EXT = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff'}
+
+MODEL_NAME = 'eva02_base_patch14_448.mim_in22k_ft_in22k_in1k'
+TRAINING_SEED = 42
+SPLIT_SEEDS = [0, 1, 2, 3, 4]
+SPLIT_COUNTS = (3326, 617, 809)
+EXPECTED_CLASSES = {
+    'Cardboard', 'Food Organics', 'Glass', 'Metal', 'Miscellaneous Trash',
+    'Paper', 'Plastic', 'Textile Trash', 'Vegetation',
+}
+VALID_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff'}
+
+PHASE1_EPOCHS = 5
+PHASE2_EPOCHS = 30
+PHASE1_LR = 1e-3
+PHASE2_BACKBONE_LR = 8e-6
+PHASE2_HEAD_LR = 4e-5
+PHASE2_WARMUP_EPOCHS = 2
+LAYER_DECAY = 0.75
+WEIGHT_DECAY = 1e-4
+LABEL_SMOOTHING = 0.05
+GRAD_CLIP_NORM = 1.0
+ACCUMULATION_STEPS = 2
+AMP_DTYPE = torch.float16
+
+DATA_CONFIG = {
+    'input_size': (3, 448, 448),
+    'mean': (0.48145466, 0.4578275, 0.40821073),
+    'std': (0.26862954, 0.26130258, 0.27577711),
+    'interpolation': 'bicubic',
+    'crop_pct': 1.0,
+}
 
 
-def seed_all(seed):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
+def seed_worker(worker_id: int) -> None:
+    seed = TRAINING_SEED + worker_id
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument('--data-dir', type=Path, default=None,
-                   help='Root containing nine class directories (or a parent directory).')
-    p.add_argument('--output-dir', type=Path, default=Path.home() / 'realwaste_eva02_stratified_saved')
-    p.add_argument('--seeds', type=int, nargs='+', default=[0])
-    p.add_argument('--workers', type=int, default=4)
-    p.add_argument('--eval-workers', type=int, default=2)
-    p.add_argument('--prefetch', type=int, default=4)
-    p.add_argument('--batch-size', type=int, default=4)
-    p.add_argument('--accum', type=int, default=2)
-    p.add_argument('--head-epochs', type=int, default=5)
-    p.add_argument('--finetune-epochs', type=int, default=30)
-    p.add_argument('--resume', action='store_true', help='Skip seeds with final_metrics.json (not partial epoch resume).')
-    p.add_argument('--no-pretrained', action='store_true', help='Only for local testing; normally do not use.')
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--data-dir', type=Path, default=None)
+    parser.add_argument('--output-dir', type=Path,
+                        default=Path.home() / 'realwaste_eva02_stratified_saved')
+    parser.add_argument('--seeds', nargs='+', type=int,
+                        choices=SPLIT_SEEDS, default=SPLIT_SEEDS)
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--eval-workers', type=int, default=2)
+    parser.add_argument('--prefetch', type=int, default=4)
+    parser.add_argument('--batch-size', type=int, default=4)
+    parser.add_argument('--accum', type=int, default=ACCUMULATION_STEPS)
+    parser.add_argument('--head-epochs', type=int, default=PHASE1_EPOCHS)
+    parser.add_argument('--finetune-epochs', type=int, default=PHASE2_EPOCHS)
+    parser.add_argument('--resume', action='store_true',
+                        help='Skip completed splits; does not resume a partial epoch.')
+    parser.add_argument('--no-pretrained', action='store_true',
+                        help='Debugging only; not part of the paper protocol.')
+    return parser.parse_args()
 
 
-def find_data_root(requested):
-    candidates = []
-    if requested: candidates.append(requested.expanduser())
+def find_data_root(requested: Path | None) -> Path:
+    if requested is not None:
+        candidates = [requested.expanduser()]
     else:
-        base = Path.home()
-        candidates += [base / x for x in ('RealWaste', 'realwaste', 'RealWaste-main', 'datasets/RealWaste',
-                                           'datasets/realwaste', 'data/RealWaste', 'realwaste_dataset')]
-    expected = {'Cardboard', 'Food Organics', 'Glass', 'Metal', 'Miscellaneous Trash',
-                'Paper', 'Plastic', 'Textile Trash', 'Vegetation'}
-    for root in candidates:
-        if not root.exists(): continue
-        for folder in [root] + [x for x in root.iterdir() if x.is_dir()]:
-            if expected.issubset({x.name for x in folder.iterdir() if x.is_dir()}):
+        home = Path.home()
+        candidates = [home / value for value in (
+            'RealWaste', 'realwaste', 'RealWaste-main', 'datasets/RealWaste',
+            'datasets/realwaste', 'data/RealWaste', 'realwaste_dataset',
+        )]
+    for candidate in candidates:
+        if not candidate.is_dir():
+            continue
+        folders = [candidate] + [p for p in candidate.iterdir() if p.is_dir()]
+        for folder in folders:
+            if EXPECTED_CLASSES.issubset({p.name for p in folder.iterdir() if p.is_dir()}):
                 return folder
-    raise FileNotFoundError('Could not locate nine RealWaste class folders. Supply --data-dir /path/to/RealWaste')
+    raise FileNotFoundError(
+        'Could not locate the nine RealWaste category folders. '
+        'Pass --data-dir /path/to/RealWaste.'
+    )
 
 
-def collect(root):
-    classes = sorted(x.name for x in root.iterdir() if x.is_dir())
-    assert len(classes) == 9, f'Expected 9 folders, found {classes}'
-    paths, y = [], []
-    for i, cls in enumerate(classes):
-        for file in sorted((root / cls).rglob('*')):
-            if file.is_file() and file.suffix.lower() in EXT:
-                paths.append(file); y.append(i)
-    assert len(paths) == 4752, f'Expected 4752 images; found {len(paths)}'
-    print('Classes:', classes, flush=True)
-    print('Images:', len(paths), 'Counts:', {c:y.count(i) for i,c in enumerate(classes)}, flush=True)
-    return paths, np.array(y, dtype=np.int64), classes
+def discover_dataset(root: Path):
+    classes = sorted(p.name for p in root.iterdir() if p.is_dir())
+    if set(classes) != EXPECTED_CLASSES:
+        raise ValueError(f'Expected 9 RealWaste categories, found {classes}')
+    paths = []
+    labels = []
+    for class_index, class_name in enumerate(classes):
+        for path in sorted((root / class_name).rglob('*')):
+            if path.is_file() and path.suffix.lower() in VALID_EXTENSIONS:
+                paths.append(path)
+                labels.append(class_index)
+    if len(paths) != sum(SPLIT_COUNTS):
+        raise ValueError(f'Expected 4752 images, found {len(paths)}')
+    return paths, np.asarray(labels, dtype=np.int64), classes
 
 
-def decode(paths):
-    print('Predecoding all 4752 RGB images to system RAM...', flush=True)
-    arrays = []
-    nbytes = 0
+def predecode_to_ram(paths):
+    images = []
     t0 = time.time()
-    for n, p in enumerate(paths, 1):
-        with Image.open(p) as im:
-            arr = np.asarray(im.convert('RGB')).copy()
-        arrays.append(arr)
-        nbytes += arr.nbytes
-        if n % 500 == 0:
-            print(f'  {n}/{len(paths)} images; decoded RAM {nbytes / 2**30:.2f} GiB', flush=True)
-    print(f'RGB cache: {nbytes / 2**30:.2f} GiB in {time.time()-t0:.1f}s', flush=True)
-    return arrays
+    for index, path in enumerate(paths, 1):
+        with Image.open(path) as image:
+            images.append(np.asarray(image.convert('RGB'), dtype=np.uint8).copy())
+        if index % 500 == 0 or index == len(paths):
+            print(f'[CACHE] {index}/{len(paths)} images in {time.time()-t0:.1f}s', flush=True)
+    return images
 
 
-# Replace with transforms from the original script if exact reproduction is required.
-MEAN = (0.485, 0.456, 0.406)
-STD = (0.229, 0.224, 0.225)
-TRAIN_TF = transforms.Compose([
-    transforms.RandomResizedCrop(448, scale=(0.8, 1.0), interpolation=InterpolationMode.BICUBIC),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(), transforms.Normalize(MEAN, STD)
-])
-EVAL_TF = transforms.Compose([
-    transforms.Resize((448, 448), interpolation=InterpolationMode.BICUBIC),
-    transforms.ToTensor(), transforms.Normalize(MEAN, STD)
-])
+def build_transforms():
+    # Matches the explicitly configured transforms in trashnet.py/household.py.
+    train_transform = create_transform(
+        input_size=DATA_CONFIG['input_size'], is_training=True,
+        mean=DATA_CONFIG['mean'], std=DATA_CONFIG['std'],
+        interpolation=DATA_CONFIG['interpolation'],
+        hflip=0.5, color_jitter=0.08,
+        re_prob=0.10, re_mode='pixel', re_count=1,
+    )
+    eval_transform = create_transform(
+        input_size=DATA_CONFIG['input_size'], is_training=False,
+        mean=DATA_CONFIG['mean'], std=DATA_CONFIG['std'],
+        interpolation=DATA_CONFIG['interpolation'],
+        crop_pct=DATA_CONFIG['crop_pct'],
+    )
+    return train_transform, eval_transform
 
 
 class RAMDataset(Dataset):
-    def __init__(self, arrays, labels, indices, transform):
-        self.arrays = arrays; self.labels = labels; self.indices = np.asarray(indices); self.transform = transform
-    def __len__(self): return len(self.indices)
-    def __getitem__(self, idx):
-        j = int(self.indices[idx]); img = Image.fromarray(self.arrays[j])
-        return self.transform(img), int(self.labels[j]), j
+    def __init__(self, images, labels, indices, transform):
+        self.images = images
+        self.labels = labels
+        self.indices = np.asarray(indices)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, item):
+        source_index = int(self.indices[item])
+        image = Image.fromarray(self.images[source_index])
+        return self.transform(image), int(self.labels[source_index]), source_index
 
 
-def loader(ds, batch, workers, shuffle, prefetch):
-    kwargs = dict(batch_size=batch, shuffle=shuffle, num_workers=workers,
-                  pin_memory=True, drop_last=False, persistent_workers=workers > 0)
-    if workers: kwargs['prefetch_factor'] = prefetch
-    return DataLoader(ds, **kwargs)
+def make_loader(dataset, train: bool, batch_size: int, workers: int, prefetch: int):
+    generator = torch.Generator()
+    generator.manual_seed(TRAINING_SEED)
+    kwargs = dict(
+        dataset=dataset, batch_size=batch_size, shuffle=train,
+        drop_last=False, num_workers=workers, pin_memory=True,
+        persistent_workers=(workers > 0),
+        worker_init_fn=(seed_worker if workers > 0 else None),
+        generator=(generator if train else None),
+    )
+    if workers > 0:
+        kwargs['prefetch_factor'] = prefetch
+    return DataLoader(**kwargs)
 
 
-def split_seed(y, s):
-    all_ids = np.arange(len(y))
-    tr, rem = train_test_split(all_ids, train_size=COUNTS[0], random_state=s, stratify=y)
-    va, te = train_test_split(rem, train_size=COUNTS[1], random_state=s,
-                              stratify=y[rem])
-    assert (len(tr), len(va), len(te)) == COUNTS
-    assert len(set(tr) & set(te)) == 0
-    return tr, va, te
+def make_split(labels, split_seed: int):
+    # Preserve exact RealWaste split sizes (3326/617/809).
+    all_indices = np.arange(len(labels))
+    train_indices, remaining = train_test_split(
+        all_indices, train_size=SPLIT_COUNTS[0], random_state=split_seed,
+        shuffle=True, stratify=labels,
+    )
+    val_indices, test_indices = train_test_split(
+        remaining, train_size=SPLIT_COUNTS[1], random_state=split_seed,
+        shuffle=True, stratify=labels[remaining],
+    )
+    if tuple(map(len, (train_indices, val_indices, test_indices))) != SPLIT_COUNTS:
+        raise AssertionError('Unexpected train/validation/test sizes')
+    if len(set(train_indices) | set(val_indices) | set(test_indices)) != len(labels):
+        raise AssertionError('Split overlap or missing samples')
+    return train_indices, val_indices, test_indices
 
 
-def make_model(num_classes, pretrained):
-    m = timm.create_model(MODEL, pretrained=pretrained, num_classes=num_classes)
-    return m
+def create_model(num_classes: int, pretrained: bool):
+    model = timm.create_model(MODEL_NAME, pretrained=pretrained, num_classes=num_classes)
+    if hasattr(model, 'set_grad_checkpointing'):
+        model.set_grad_checkpointing(enable=True)
+    return model
 
 
-def head_params(model):
-    names = ('head', 'fc', 'classifier')
-    params = [p for n,p in model.named_parameters() if p.requires_grad and
-              (n.split('.')[0] in names)]
-    if not params: raise RuntimeError('Cannot identify classifier head parameters')
-    return params
+def freeze_backbone_train_head(model):
+    for param in model.parameters():
+        param.requires_grad_(False)
+    if not hasattr(model, 'head'):
+        raise RuntimeError('Expected EVA02 classifier at model.head')
+    for param in model.head.parameters():
+        param.requires_grad_(True)
 
 
-def set_head_only(model):
-    for p in model.parameters(): p.requires_grad_(False)
-    for p in head_params_unfrozen(model): p.requires_grad_(True)
+def build_simple_param_groups(model, lr: float):
+    decay_params, no_decay_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        no_decay = (param.ndim <= 1 or name.endswith('.bias') or
+                    'pos_embed' in name or 'cls_token' in name)
+        (no_decay_params if no_decay else decay_params).append(param)
+    return [
+        {'params': decay_params, 'lr': lr, 'weight_decay': WEIGHT_DECAY},
+        {'params': no_decay_params, 'lr': lr, 'weight_decay': 0.0},
+    ]
 
 
-def head_params_unfrozen(model):
-    return [p for n,p in model.named_parameters() if n.split('.')[0] in ('head','fc','classifier')]
-
-
-def layer_id(name, depth):
-    if name.startswith(('head.', 'fc.', 'classifier.')): return depth + 1
+def layer_id(name: str, nblocks: int):
+    if name.startswith('head'):
+        return nblocks + 2
+    if name.startswith('norm'):
+        return nblocks + 1
     if name.startswith('blocks.'):
-        parts = name.split('.')
-        if len(parts) > 1 and parts[1].isdigit(): return int(parts[1]) + 1
+        pieces = name.split('.')
+        if len(pieces) > 1 and pieces[1].isdigit():
+            return int(pieces[1]) + 1
     return 0
 
 
-def layerwise_groups(model, backbone_lr=8e-6, head_lr=4e-5, decay=0.75, weight_decay=1e-4):
-    depth = len(model.blocks)
+def build_layer_decay_param_groups(model):
+    nblocks = len(model.blocks)
+    max_layer_id = nblocks + 2
     groups = {}
     for name, param in model.named_parameters():
-        if not param.requires_grad: continue
-        lid = layer_id(name, depth)
-        is_head = lid == depth + 1
-        lr = head_lr if is_head else backbone_lr * decay ** (depth - lid)
-        no_decay = param.ndim <= 1 or name.endswith('.bias') or 'pos_embed' in name or 'cls_token' in name
-        wd = 0 if no_decay else weight_decay
-        key = (lid, wd)
-        if key not in groups: groups[key] = {'params':[], 'lr':lr, 'weight_decay':wd, 'initial_lr':lr}
+        if not param.requires_grad:
+            continue
+        no_decay = (param.ndim <= 1 or name.endswith('.bias') or
+                    'pos_embed' in name or 'cls_token' in name)
+        weight_decay = 0.0 if no_decay else WEIGHT_DECAY
+        if name.startswith('head'):
+            lr = PHASE2_HEAD_LR
+        else:
+            lr = PHASE2_BACKBONE_LR * (LAYER_DECAY **
+                                        (max_layer_id - layer_id(name, nblocks)))
+        key = (lr, weight_decay)
+        if key not in groups:
+            groups[key] = {'params': [], 'lr': lr, 'weight_decay': weight_decay}
         groups[key]['params'].append(param)
     return list(groups.values())
 
 
-def amp_ctx():
-    return torch.autocast(device_type='cuda', dtype=torch.float16)
+def create_scheduler(optimizer, epochs: int, warmup_epochs: int = 0):
+    if warmup_epochs <= 0:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.10, end_factor=1.0, total_iters=warmup_epochs,
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, epochs - warmup_epochs),
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs],
+    )
 
 
-def train_epoch(model, dl, optim, scaler, device, accum, epoch, epochs, mode, warmup_epochs=0):
+def train_one_epoch(model, loader, optimizer, criterion, scaler, device, accum: int):
     model.train()
-    optim.zero_grad(set_to_none=True)
-    steps = (len(dl) + accum - 1)//accum
-    # Keep epoch statistics on the GPU: avoids two forced CUDA synchronizations
-    # per batch caused by Tensor.item(). Synchronize once at epoch end.
-    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    correct = torch.zeros((), device=device, dtype=torch.int64)
-    total = 0
-    start = time.time()
-    for i, (x,y,_) in enumerate(dl):
-        x = x.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-        y = y.to(device, non_blocking=True)
-        if mode == 'finetune':
-            t = epoch + (i // accum)/max(1,steps)
-            mult = (t + 1e-8)/max(1, warmup_epochs) if t < warmup_epochs else \
-                0.5 * (1 + np.cos(np.pi * (t-warmup_epochs)/max(1,epochs-warmup_epochs)))
-            for pg in optim.param_groups: pg['lr'] = pg['initial_lr'] * float(mult)
-        # Correct scaling also for an incomplete last accumulation group.
-        group_start = (i // accum)*accum
-        group_len = min(accum, len(dl)-group_start)
-        with amp_ctx():
-            logits = model(x)
-            loss = nn.functional.cross_entropy(logits, y, label_smoothing=0.05)
-        scaler.scale(loss / group_len).backward()
-        if (i+1) % accum == 0 or i+1 == len(dl):
-            scaler.unscale_(optim)
-            nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.)
-            scaler.step(optim); scaler.update(); optim.zero_grad(set_to_none=True)
-        with torch.no_grad():
-            loss_sum += loss.detach().to(torch.float64) * y.numel()
-            correct += (logits.detach().argmax(1) == y).sum()
-        total += y.numel()
-        if (i+1) % 100 == 0:
-            print(f'    {mode} epoch {epoch+1}/{epochs}: batch {i+1}/{len(dl)}, '
-                  f'GPU memory {torch.cuda.max_memory_allocated()/2**30:.1f} GiB', flush=True)
-    torch.cuda.synchronize(device)
-    elapsed = time.time() - start
-    return {'train_loss':loss_sum.item()/total, 'train_acc':correct.item()/total*100,
-            'train_seconds':elapsed, 'train_images_per_sec':total/elapsed}
+    optimizer.zero_grad(set_to_none=True)
+    total_loss = 0.0
+    correct = 0
+    count = 0
+    for batch_number, (images, labels, _) in enumerate(loader, 1):
+        images = images.to(device, non_blocking=True).contiguous(
+            memory_format=torch.channels_last)
+        labels = labels.to(device, non_blocking=True)
+        with torch.amp.autocast('cuda', dtype=AMP_DTYPE):
+            logits = model(images)
+            loss = criterion(logits, labels)
+        # Match TrashNet and Household gradient accumulation behavior.
+        scaler.scale(loss / accum).backward()
+        if batch_number % accum == 0 or batch_number == len(loader):
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        preds = logits.argmax(dim=1)
+        correct += int((preds == labels).sum().item())
+        count += labels.size(0)
+        total_loss += loss.item() * labels.size(0)
+    return total_loss / count, 100.0 * correct / count
 
 
-@torch.inference_mode()
-def evaluate(model, dl, device, return_predictions=False):
+@torch.no_grad()
+def evaluate(model, loader, criterion, device, return_predictions=False):
     model.eval()
-    ys, preds, ids, probs = [], [], [], []
-    total_loss = 0.; total = 0
-    for x,y,idx in dl:
-        x = x.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-        yy = y.to(device, non_blocking=True)
-        with amp_ctx(): logits = model(x)
-        total_loss += nn.functional.cross_entropy(logits.float(), yy, reduction='sum').item()
-        pr = torch.softmax(logits.float(), dim=1).cpu().numpy()
-        probs.append(pr)
-        ys.extend(y.tolist()); preds.extend(pr.argmax(axis=1).tolist()); ids.extend(idx.tolist())
-        total += len(y)
-    ys = np.asarray(ys); preds=np.asarray(preds)
-    d = {'loss':total_loss/total, 'accuracy':100*accuracy_score(ys,preds),
-         'macro_f1':100*f1_score(ys,preds,average='macro',zero_division=0),
-         'weighted_f1':100*f1_score(ys,preds,average='weighted',zero_division=0)}
-    if return_predictions: return d, ys, preds, np.asarray(ids), np.concatenate(probs)
-    return d
+    total_loss = 0.0
+    count = 0
+    targets, predictions, indices, probabilities = [], [], [], []
+    for images, labels, source_ids in loader:
+        images = images.to(device, non_blocking=True).contiguous(
+            memory_format=torch.channels_last)
+        labels_gpu = labels.to(device, non_blocking=True)
+        with torch.amp.autocast('cuda', dtype=AMP_DTYPE):
+            logits = model(images)
+            loss = criterion(logits, labels_gpu)
+        probabilities_batch = torch.softmax(logits.float(), dim=1).cpu().numpy()
+        preds = probabilities_batch.argmax(axis=1)
+        total_loss += loss.item() * labels.size(0)
+        count += labels.size(0)
+        targets.extend(labels.numpy().tolist())
+        predictions.extend(preds.tolist())
+        indices.extend(source_ids.numpy().tolist())
+        probabilities.append(probabilities_batch)
+    targets = np.asarray(targets, dtype=np.int64)
+    predictions = np.asarray(predictions, dtype=np.int64)
+    metrics = {
+        'loss': total_loss / count,
+        'accuracy': 100.0 * accuracy_score(targets, predictions),
+        'macro_precision': 100.0 * precision_score(
+            targets, predictions, average='macro', zero_division=0),
+        'macro_recall': 100.0 * recall_score(
+            targets, predictions, average='macro', zero_division=0),
+        'macro_f1': 100.0 * f1_score(
+            targets, predictions, average='macro', zero_division=0),
+        'weighted_f1': 100.0 * f1_score(
+            targets, predictions, average='weighted', zero_division=0),
+    }
+    if return_predictions:
+        return (metrics, targets, predictions, np.asarray(indices),
+                np.concatenate(probabilities, axis=0))
+    return metrics
 
 
-def atomic_save(model, path, seed, classes, stage, epoch):
-    tmp = path.with_suffix('.tmp')
-    torch.save({'model':{k:v.detach().cpu() for k,v in model.state_dict().items()},
-                'model_name':MODEL, 'classes':classes, 'split_seed':seed,
-                'training_seed':TRAIN_SEED, 'stage':stage, 'epoch':epoch}, tmp)
-    os.replace(tmp, path)
+def save_model(model, path: Path, split_seed: int, classes, phase: str,
+               epoch: int, validation_accuracy: float):
+    temp_path = path.with_suffix('.tmp')
+    torch.save({
+        'model': {key: value.detach().cpu() for key, value in model.state_dict().items()},
+        'model_name': MODEL_NAME,
+        'classes': classes,
+        'split_seed': split_seed,
+        'training_seed': TRAINING_SEED,
+        'phase': phase,
+        'epoch': epoch,
+        'best_val_accuracy': validation_accuracy,
+    }, temp_path)
+    os.replace(temp_path, path)
+
+
+def run_split(args, split_seed, paths, labels, classes, images,
+              train_transform, eval_transform, device):
+    output = args.output_dir / f'seed_{split_seed}'
+    output.mkdir(parents=True, exist_ok=True)
+    final_metrics_path = output / 'final_metrics.json'
+    if args.resume and final_metrics_path.exists() and (output / 'test_predictions.csv').exists():
+        print(f'[SKIP] Completed split {split_seed}', flush=True)
+        return json.loads(final_metrics_path.read_text())
+
+    set_seed(TRAINING_SEED)
+    train_idx, val_idx, test_idx = make_split(labels, split_seed)
+    (output / 'split_indices.json').write_text(json.dumps({
+        'split_seed': split_seed, 'training_seed': TRAINING_SEED,
+        'train': train_idx.tolist(), 'val': val_idx.tolist(),
+        'test': test_idx.tolist(), 'class_names': classes,
+        'paths': [str(path) for path in paths],
+    }, indent=2))
+
+    train_loader = make_loader(
+        RAMDataset(images, labels, train_idx, train_transform),
+        True, args.batch_size, args.workers, args.prefetch)
+    val_loader = make_loader(
+        RAMDataset(images, labels, val_idx, eval_transform),
+        False, args.batch_size, args.eval_workers, args.prefetch)
+    test_loader = make_loader(
+        RAMDataset(images, labels, test_idx, eval_transform),
+        False, args.batch_size, args.eval_workers, args.prefetch)
+
+    model = create_model(len(classes), not args.no_pretrained).to(
+        device, memory_format=torch.channels_last)
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    scaler = torch.amp.GradScaler('cuda')
+    history = []
+    print(f'\n[SPLIT {split_seed}] train={len(train_idx)} val={len(val_idx)} '
+          f'test={len(test_idx)}', flush=True)
+
+    # Stage 1: frozen backbone; head training over five epochs.
+    freeze_backbone_train_head(model)
+    optimizer = torch.optim.AdamW(build_simple_param_groups(model, PHASE1_LR))
+    scheduler = create_scheduler(optimizer, args.head_epochs)
+    best_head_accuracy = float('-inf')
+    for epoch in range(1, args.head_epochs + 1):
+        t0 = time.time()
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, optimizer, criterion, scaler, device, args.accum)
+        val_metrics = evaluate(model, val_loader, criterion, device)
+        scheduler.step()
+        history.append({
+            'phase': 'phase1_head_only', 'epoch': epoch,
+            'train_loss': train_loss, 'train_accuracy': train_acc,
+            'val_loss': val_metrics['loss'],
+            'val_accuracy': val_metrics['accuracy'],
+            'val_macro_precision': val_metrics['macro_precision'],
+            'val_macro_recall': val_metrics['macro_recall'],
+            'val_macro_f1': val_metrics['macro_f1'],
+            'val_weighted_f1': val_metrics['weighted_f1'],
+            'lr': optimizer.param_groups[0]['lr'],
+            'epoch_seconds': time.time() - t0,
+        })
+        pd.DataFrame(history).to_csv(output / 'training_log.csv', index=False)
+        if val_metrics['accuracy'] > best_head_accuracy:
+            best_head_accuracy = val_metrics['accuracy']
+            save_model(model, output / 'best_head_model.pt', split_seed, classes,
+                       'phase1_head_only', epoch, best_head_accuracy)
+        print(f'  Stage 1 {epoch:02d}/{args.head_epochs}: '
+              f'val={val_metrics["accuracy"]:.3f}% '
+              f'lr={optimizer.param_groups[0]["lr"]:.3e}', flush=True)
+    del optimizer, scheduler
+
+    # Stage 2 continues directly from final Stage 1 state, not head best state.
+    for parameter in model.parameters():
+        parameter.requires_grad_(True)
+    optimizer = torch.optim.AdamW(build_layer_decay_param_groups(model))
+    scheduler = create_scheduler(optimizer, args.finetune_epochs,
+                                 PHASE2_WARMUP_EPOCHS)
+    best_val_accuracy = float('-inf')
+    for epoch in range(1, args.finetune_epochs + 1):
+        t0 = time.time()
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, optimizer, criterion, scaler, device, args.accum)
+        val_metrics = evaluate(model, val_loader, criterion, device)
+        scheduler.step()
+        history.append({
+            'phase': 'phase2_full_finetune', 'epoch': epoch,
+            'train_loss': train_loss, 'train_accuracy': train_acc,
+            'val_loss': val_metrics['loss'],
+            'val_accuracy': val_metrics['accuracy'],
+            'val_macro_precision': val_metrics['macro_precision'],
+            'val_macro_recall': val_metrics['macro_recall'],
+            'val_macro_f1': val_metrics['macro_f1'],
+            'val_weighted_f1': val_metrics['weighted_f1'],
+            'lr': optimizer.param_groups[0]['lr'],
+            'epoch_seconds': time.time() - t0,
+        })
+        pd.DataFrame(history).to_csv(output / 'training_log.csv', index=False)
+        # Highest validation accuracy; later epoch replaces earlier ties.
+        if val_metrics['accuracy'] >= best_val_accuracy:
+            best_val_accuracy = val_metrics['accuracy']
+            save_model(model, output / 'best_model.pt', split_seed, classes,
+                       'phase2_full_finetune', epoch, best_val_accuracy)
+        print(f'  Stage 2 {epoch:02d}/{args.finetune_epochs}: '
+              f'val={val_metrics["accuracy"]:.3f}% '
+              f'lr={optimizer.param_groups[0]["lr"]:.3e}', flush=True)
+
+    checkpoint = torch.load(output / 'best_model.pt', map_location='cpu',
+                            weights_only=False)
+    model.load_state_dict(checkpoint['model'], strict=True)
+    metrics, truth, predicted, source_indices, probs = evaluate(
+        model, test_loader, criterion, device, return_predictions=True)
+    result = {
+        'split_seed': split_seed,
+        'training_seed': TRAINING_SEED,
+        'model': MODEL_NAME,
+        'best_stage2_epoch': int(checkpoint['epoch']),
+        'best_validation_accuracy': float(best_val_accuracy),
+        'train_count': int(len(train_idx)),
+        'val_count': int(len(val_idx)),
+        'test_count': int(len(test_idx)),
+        'test_accuracy': float(metrics['accuracy']),
+        'test_macro_f1': float(metrics['macro_f1']),
+        'test_weighted_f1': float(metrics['weighted_f1']),
+        'test_loss': float(metrics['loss']),
+    }
+
+    prediction_columns = {
+        'image_path': [str(paths[i]) for i in source_indices],
+        'true_class': [classes[i] for i in truth],
+        'predicted_class': [classes[i] for i in predicted],
+        'confidence': probs.max(axis=1).tolist(),
+        'correct': (truth == predicted).tolist(),
+    }
+    for class_index, class_name in enumerate(classes):
+        prediction_columns['prob_' + class_name.lower().replace(' ', '_')] = (
+            probs[:, class_index].tolist())
+    pd.DataFrame(prediction_columns).to_csv(output / 'test_predictions.csv', index=False)
+    pd.DataFrame(
+        confusion_matrix(truth, predicted, labels=list(range(len(classes)))),
+        index=classes, columns=classes,
+    ).to_csv(output / 'confusion_matrix.csv')
+    pd.DataFrame(classification_report(
+        truth, predicted, labels=list(range(len(classes))),
+        target_names=classes, zero_division=0, output_dict=True,
+    )).T.to_csv(output / 'classification_report.csv')
+    final_metrics_path.write_text(json.dumps(result, indent=2))
+    print(f'[SPLIT {split_seed}] TEST {metrics["accuracy"]:.4f}% '
+          f'best Stage 2 epoch {checkpoint["epoch"]}', flush=True)
+
+    del model, optimizer, scheduler, scaler, train_loader, val_loader, test_loader
+    gc.collect()
+    torch.cuda.empty_cache()
+    return result
 
 
 def main():
     args = parse_args()
-    if not torch.cuda.is_available(): raise RuntimeError('CUDA GPU required')
-    torch.set_num_threads(1)
+    if not torch.cuda.is_available():
+        raise RuntimeError('A CUDA GPU is required.')
+    if args.accum <= 0 or args.batch_size <= 0:
+        raise ValueError('--batch-size and --accum must be positive.')
+    if args.head_epochs <= 0 or args.finetune_epochs <= PHASE2_WARMUP_EPOCHS:
+        raise ValueError('Invalid epoch counts for the configured schedulers.')
+
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    print('CUDA device:', torch.cuda.get_device_name(0), flush=True)
-    root = find_data_root(args.data_dir)
-    paths,y,classes = collect(root)
-    arrays = decode(paths)
+    device = torch.device('cuda:0')
+    args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    device=torch.device('cuda')
-    for seed in args.seeds:
-        out=args.output_dir / f'seed_{seed}'
-        out.mkdir(parents=True, exist_ok=True)
-        if args.resume and (out/'final_metrics.json').exists():
-            print(f'Skipping completed seed {seed}', flush=True); continue
-        seed_all(TRAIN_SEED)
-        tr,va,te=split_seed(y,seed)
-        (out/'split_indices.json').write_text(json.dumps({
-            'split_seed':seed,'training_seed':TRAIN_SEED,
-            'train':tr.tolist(),'val':va.tolist(),'test':te.tolist(),
-            'class_names':classes,'paths':[str(x) for x in paths]},indent=2))
-        # fresh loaders per seed; persistent workers speed subsequent epochs.
-        train_dl=loader(RAMDataset(arrays,y,tr,TRAIN_TF),args.batch_size,args.workers,True,args.prefetch)
-        val_dl=loader(RAMDataset(arrays,y,va,EVAL_TF),args.batch_size,args.eval_workers,False,args.prefetch)
-        test_dl=loader(RAMDataset(arrays,y,te,EVAL_TF),args.batch_size,args.eval_workers,False,args.prefetch)
-        print(f'\n====== SEED {seed}: train={len(tr)} val={len(va)} test={len(te)} ======',flush=True)
-        model=make_model(len(classes),not args.no_pretrained).to(device,memory_format=torch.channels_last)
-        set_head_only(model)
-        optimizer=torch.optim.AdamW(head_params(model),lr=1e-3,weight_decay=1e-4)
-        scaler=torch.amp.GradScaler('cuda')
-        log=[]
-        best_head=-1.
-        # Stage 1 trains classifier only.
-        for ep in range(args.head_epochs):
-            td=train_epoch(model,train_dl,optimizer,scaler,device,args.accum,ep,args.head_epochs,'head')
-            vd=evaluate(model,val_dl,device)
-            log.append({'stage':'head','epoch':ep+1,**td,**{'val_'+k:v for k,v in vd.items()}})
-            pd.DataFrame(log).to_csv(out/'training_log.csv',index=False)
-            print('HEAD',ep+1,'val acc',round(vd['accuracy'],4),'val macroF1',round(vd['macro_f1'],4),flush=True)
-            if vd['accuracy'] > best_head:
-                best_head=vd['accuracy']
-                atomic_save(model,out/'best_head_model.pt',seed,classes,'head',ep+1)
-        del optimizer,scaler
-        gc.collect(); torch.cuda.empty_cache()
-        # Stage 2 continues directly from the final Stage 1 model state.
-        for p in model.parameters(): p.requires_grad_(True)
-        if hasattr(model,'set_grad_checkpointing'):
-            model.set_grad_checkpointing(True)
-        optimizer=torch.optim.AdamW(layerwise_groups(model),weight_decay=1e-4)
-        scaler=torch.amp.GradScaler('cuda')
-        best=-1.
-        for ep in range(args.finetune_epochs):
-            td=train_epoch(model,train_dl,optimizer,scaler,device,args.accum,ep,
-                           args.finetune_epochs,'finetune',warmup_epochs=2)
-            vd=evaluate(model,val_dl,device)
-            log.append({'stage':'finetune','epoch':ep+1,**td,
-                        **{'val_'+k:v for k,v in vd.items()}})
-            pd.DataFrame(log).to_csv(out/'training_log.csv',index=False)
-            print('FINETUNE',ep+1,'val acc',round(vd['accuracy'],4),
-                  'val macroF1',round(vd['macro_f1'],4),'train seconds',round(td['train_seconds']),flush=True)
-            # checkpoint based solely on validation, never test.
-            if vd['accuracy'] > best:
-                best=vd['accuracy']
-                atomic_save(model,out/'best_model.pt',seed,classes,'finetune',ep+1)
-        best_ckpt=torch.load(out/'best_model.pt',map_location='cpu',weights_only=False)
-        model.load_state_dict(best_ckpt['model'])
-        result,truth,pred,indices,prob=evaluate(model,test_dl,device,True)
-        d={
-            'split_seed':seed,'training_seed':TRAIN_SEED,'model':MODEL,
-            'best_stage2_epoch':best_ckpt['epoch'],'best_validation_accuracy':best,
-            'train_count':len(tr),'val_count':len(va),'test_count':len(te),
-            'test_accuracy':result['accuracy'],'test_macro_f1':result['macro_f1'],
-            'test_weighted_f1':result['weighted_f1'],'test_loss':result['loss']
-        }
-        data={'image_path':[str(paths[i]) for i in indices],
-              'true_class':[classes[i] for i in truth],
-              'predicted_class':[classes[i] for i in pred],
-              'confidence':prob.max(axis=1).tolist(),
-              'correct':(truth == pred).tolist()}
-        for j,c in enumerate(classes):
-            data['prob_'+c.lower().replace(' ','_')]=prob[:,j].tolist()
-        pd.DataFrame(data).to_csv(out/'test_predictions.csv',index=False)
-        pd.DataFrame(confusion_matrix(truth,pred,labels=list(range(len(classes)))),
-                     index=classes,columns=classes).to_csv(out/'confusion_matrix.csv')
-        report=classification_report(truth,pred,target_names=classes,
-                                     labels=list(range(len(classes))),zero_division=0,output_dict=True)
-        pd.DataFrame(report).T.to_csv(out/'classification_report.csv')
-        (out/'final_metrics.json').write_text(json.dumps(d,indent=2))
-        print('SEED',seed,'FINAL:',json.dumps(d,indent=2),flush=True)
-        del model, optimizer, scaler, train_dl, val_dl, test_dl, best_ckpt
-        gc.collect(); torch.cuda.empty_cache()
-    summaries=[]
-    for seed in args.seeds:
-        path=args.output_dir/f'seed_{seed}'/'final_metrics.json'
-        if path.exists(): summaries.append(json.loads(path.read_text()))
-    if summaries:
-        pd.DataFrame(summaries).to_csv(args.output_dir/'seed_summary.csv',index=False)
-        print('Summary saved:',args.output_dir/'seed_summary.csv',flush=True)
+    root = find_data_root(args.data_dir)
+    paths, labels, classes = discover_dataset(root)
+    print('Device:', torch.cuda.get_device_name(0))
+    print('Classes:', classes)
+    print('Split seeds:', args.seeds, '| Training seed:', TRAINING_SEED)
+    print('Batch:', args.batch_size, '| Accum:', args.accum)
+    images = predecode_to_ram(paths)
+    train_transform, eval_transform = build_transforms()
+
+    results = []
+    for split_seed in args.seeds:
+        results.append(run_split(args, split_seed, paths, labels, classes, images,
+                                 train_transform, eval_transform, device))
+        pd.DataFrame(results).sort_values('split_seed').to_csv(
+            args.output_dir / 'seed_summary.csv', index=False)
+    print('Summary saved:', args.output_dir / 'seed_summary.csv')
 
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    main()
