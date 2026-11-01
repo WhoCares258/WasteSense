@@ -83,7 +83,7 @@ from safetensors.torch import load_file as load_safetensors
 MODEL_NAME = "eva02_base_patch14_448.mim_in22k_ft_in22k_in1k"
 HF_REPO = "timm/eva02_base_patch14_448.mim_in22k_ft_in22k_in1k"
 
-SPLIT_SEEDS = [1, 2, 3, 4]
+SPLIT_SEEDS = [0, 1, 2, 3, 4]
 TRAINING_SEED = 42
 
 TRAIN_RATIO = 0.80
